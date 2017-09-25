@@ -14,8 +14,7 @@ var mod_url = require('url');
 var VError = require('verror');
 
 var lib_promstat = require('../lib/promstat');
-
-var psRunning = false;
+var lib_si = require('../lib/setinterval');
 
 function main()
 {
@@ -55,6 +54,9 @@ function main()
 	    'ps_promstat': null,
 	    /* interval timer handle */
 	    'ps_interval': null,
+
+	    /* consume() operation is currently running */
+	    'ps_running': false,
 
 	    /* output function */
 	    'ps_print': null,
@@ -102,7 +104,7 @@ function main()
 	}
 
 	/*
-	 * Parse optional command-line arguments.
+	 * Parse optional command-line arguments: INTERVAL and COUNT.
 	 */
 	args = process.argv.slice(parser.optind());
 	if (args.length > 0) {
@@ -160,7 +162,9 @@ function main()
 				'label': 'TARGET',
 				'width': 35
 			    }, {
-				'label': promstatCmd.ps_metrics[0]
+				'label': promstatCmd.ps_metrics[0],
+				'align': 'right',
+				'width': promstatCmd.ps_metrics[0].length
 			    } ]
 			});
 		} else {
@@ -171,6 +175,11 @@ function main()
 	promstatGo(promstatCmd);
 }
 
+/*
+ * Given an argument for the "-t/--target" option, check whether it is a valid,
+ * supported URL.  If so, return a parsed version of it.  If not, return an
+ * error.
+ */
 function validateTarget(target)
 {
 	var u, p;
@@ -221,6 +230,9 @@ function validateTarget(target)
 	});
 }
 
+/*
+ * Kick off the "promstat" program.
+ */
 function promstatGo(args)
 {
 	var promstat;
@@ -240,61 +252,37 @@ function promstatGo(args)
 		promstat.addMetric(m);
 	});
 
-	args.ps_interval = setIntervalPrecise(
+	args.ps_interval = lib_si.setIntervalPrecise(
 	    promstatTick, args.ps_intervalms, args, promstat);
 }
 
-function setIntervalPrecise(func, intervalms)
-{
-	var interval;
-
-	mod_assertplus.func(func, 'func');
-	mod_assertplus.number(intervalms, 'interval');
-	mod_assertplus.ok(intervalms >= 0, 'interval >= 0');
-
-	interval = {
-	    'i_func': func,
-	    'i_interval': intervalms,
-	    'i_args': Array.prototype.slice.call(arguments, 2),
-	    'i_id': null
-	};
-
-	interval.i_id = setTimeout(
-	    siFireTimeout, interval.i_interval, interval);
-	return (interval);
-}
-
-function siFireTimeout(interval)
-{
-	interval.i_id = setTimeout(
-	    siFireTimeout, interval.i_interval, interval);
-	interval.i_func.apply(null, interval.i_args);
-}
-
-function clearIntervalPrecise(interval)
-{
-	clearTimeout(interval.i_id);
-	interval.i_id = null;
-}
-
+/*
+ * Invoked once per interval to fetch stats and print them out.  This currently
+ * skips an iteration if any call is outstanding.
+ */
 function promstatTick(promstatCmd)
 {
 	var when;
 
-	if (psRunning) {
+	if (promstatCmd.ps_running) {
 		/* TODO what do we really want to do in this case? */
 		return;
 	}
 
+	/*
+	 * If this is the last data point, all we have to do to stop the program
+	 * is to clear the interval timer.
+	 */
 	++promstatCmd.ps_nemitted;
 	if (promstatCmd.ps_ndatapoints !== null &&
 	    promstatCmd.ps_nemitted == promstatCmd.ps_ndatapoints) {
-		clearIntervalPrecise(promstatCmd.ps_interval);
+		lib_si.clearIntervalPrecise(promstatCmd.ps_interval);
 	}
 
 	when = new Date();
+	promstatCmd.ps_running = true;
 	promstatCmd.ps_promstat.consume(function onConsume(merr, results) {
-		psRunning = false;
+		promstatCmd.ps_running = false;
 
 		if (merr) {
 			VError.errorForEach(merr, function (err) {
@@ -306,6 +294,10 @@ function promstatTick(promstatCmd)
 	});
 }
 
+/*
+ * Invoked after we've finished collecting data points from all targets to
+ * process the output and print it out.
+ */
 function promstatReport(when, promstatCmd, results)
 {
 	mod_jsprim.forEachKey(results, function (_, result) {
@@ -347,6 +339,13 @@ function promstatReport(when, promstatCmd, results)
 	});
 }
 
+/*
+ * Outputters
+ */
+
+/*
+ * Compact, tabular output is used when there's exactly one metric.
+ */
 function promstatReportTable(promstatCmd, datapoint)
 {
 	var timestr, row;
@@ -361,6 +360,10 @@ function promstatReportTable(promstatCmd, datapoint)
 	promstatCmd.ps_table.writeRow(row);
 }
 
+/*
+ * Full output is used by default.  It's not especially convenient to read, but
+ * it includes all of the data.
+ */
 function promstatReportFull(promstatCmd, datapoint)
 {
 	if (promstatCmd.ps_last_time != datapoint.when.getTime()) {
@@ -371,6 +374,10 @@ function promstatReportFull(promstatCmd, datapoint)
 	console.log('%s %s', datapoint.metricName, datapoint.value);
 }
 
+/*
+ * If the consumer wants JSON output, they may as well use the HTTP API that
+ * we're querying directly, but we have it here because it's easy to do.
+ */
 function promstatReportJson(promstatCmd, datapoint)
 {
 	console.log(JSON.stringify(datapoint));
