@@ -10,6 +10,7 @@
 		"assert-plus": "^1.0.0",
 		"cmdutil": "^1.1.0",
 		"jsprim": "^1.4.1",
+		"lstream": "0.0.4",
 		"posix-getopt": "^1.2.0",
 		"strsplit": "^1.0.0",
 		"tab": "^1.0.0",

@@ -9,8 +9,13 @@ var mod_assertplus = require('assert-plus');
 var mod_cmdutil = require('cmdutil');
 var mod_getopt = require('posix-getopt');
 var mod_jsprim = require('jsprim');
+var mod_tab = require('tab');
 var mod_url = require('url');
 var VError = require('verror');
+
+var lib_promstat = require('../lib/promstat');
+
+var psRunning = false;
 
 function main()
 {
@@ -20,7 +25,7 @@ function main()
 	mod_cmdutil.configure({
 	    'usageMessage': 'poll and report Prometheus agent stats',
 	    'synopses': [
-		'-t/--target URL ... -m/--metric METRIC_NAME ... ' +
+		'[-j/--json] -t/--target URL ... -m/--metric METRIC_NAME ... ' +
 		    '[INTERVAL [COUNT]]'
 	    ]
 	});
@@ -29,12 +34,18 @@ function main()
 	    'ps_metrics': [],
 	    'ps_targets': [],
 	    'ps_interval': 1000,
-	    'ps_ndatapoints': null
+	    'ps_ndatapoints': null,
+	    'ps_print': promstatReportFull,
+	    'ps_table': null
 	};
-	parser = new mod_getopt.BasicParser('m:(metric)t:(target)',
+	parser = new mod_getopt.BasicParser('j(json)m:(metric)t:(target)',
 	    process.argv);
 	while ((option = parser.getopt()) !== undefined) {
 		switch (option.option) {
+		case 'j':
+			promstatArgs.ps_print = promstatReportJson;
+			break;
+
 		case 'm':
 			p = option.optarg;
 			/* TODO check this regexp against Prom docs */
@@ -98,7 +109,30 @@ function main()
 		}
 	}
 
-	console.log(promstatArgs);
+	if (promstatArgs.ps_metrics.length === 0) {
+		mod_cmdutil.usage('must specify at least one metric');
+	}
+
+	if (promstatArgs.ps_targets.length === 0) {
+		mod_cmdutil.usage('must specify at least one target');
+	}
+
+	if (promstatArgs.ps_metrics.length == 1) {
+		promstatArgs.ps_print = promstatReportTable;
+		promstatArgs.ps_table = new mod_tab.TableOutputStream({
+		    'columns': [ {
+		        'label': 'TIME',
+			'width': 8
+		    }, {
+			'label': 'TARGET',
+			'width': 35
+		    }, {
+			'label': promstatArgs.ps_metrics[0]
+		    } ]
+		});
+	}
+
+	promstatGo(promstatArgs);
 }
 
 function validateTarget(target)
@@ -144,10 +178,143 @@ function validateTarget(target)
 	}
 
 	return ({
-	    't_hostname': u.host,
+	    't_label': u.hostname + ':' + u.port,
+	    't_hostname': u.hostname,
 	    't_port': p,
 	    't_pathname': u.pathname
 	});
+}
+
+function promstatGo(args)
+{
+	var promstat;
+
+	mod_assertplus.object(args, 'args');
+	mod_assertplus.arrayOfObject(args.ps_targets, 'args.ps_targets');
+	mod_assertplus.arrayOfString(args.ps_metrics, 'args.ps_metrics');
+	mod_assertplus.number(args.ps_interval, 'args.ps_interval');
+	mod_assertplus.optionalNumber(args.ps_ndatapoints,
+	    'args.ps_ndatapoints');
+
+	promstat = new lib_promstat.Promstat();
+	args.ps_targets.forEach(function (t) {
+		promstat.addTarget(t);
+	});
+	args.ps_metrics.forEach(function (m) {
+		promstat.addMetric(m);
+	});
+
+	setIntervalPrecise(promstatTick, args.ps_interval, args, promstat);
+}
+
+function setIntervalPrecise(func, intervalms)
+{
+	var interval;
+
+	mod_assertplus.func(func, 'func');
+	mod_assertplus.number(intervalms, 'interval');
+	mod_assertplus.ok(intervalms >= 0, 'interval >= 0');
+
+	interval = {
+	    'i_func': func,
+	    'i_interval': intervalms,
+	    'i_args': Array.prototype.slice.call(arguments, 2)
+	};
+
+	setTimeout(siFireTimeout, interval.i_interval, interval);
+}
+
+function siFireTimeout(interval)
+{
+	setTimeout(siFireTimeout, interval.i_interval, interval);
+	interval.i_func.apply(null, interval.i_args);
+}
+
+function promstatTick(psargs, promstat)
+{
+	var when;
+
+	if (psRunning) {
+		/* TODO what do we really want to do in this case? */
+		return;
+	}
+
+	when = new Date();
+	promstat.consume(function onConsume(merr, results) {
+		psRunning = false;
+
+		if (merr) {
+			VError.errorForEach(merr, function (err) {
+				mod_cmdutil.warn(err);
+			});
+		}
+
+		promstatReport(when, psargs, promstat, results);
+	});
+}
+
+function promstatReport(when, psargs, promstat, results)
+{
+	mod_jsprim.forEachKey(results, function (_, result) {
+		mod_assertplus.object(result.target, 'result.target');
+		mod_assertplus.object(result.metrics, 'result.metrics');
+
+		psargs.ps_metrics.forEach(function (metname) {
+			var met, value;
+
+			met = result.metrics[metname];
+			if (!met) {
+				value = 'no data';
+			} else {
+				switch (met.type) {
+				case 'counter':
+					value = 0;
+					mod_jsprim.forEachKey(
+					    met.valuesByFields,
+					    function (f, v) {
+						value += v;
+					    });
+					break;
+
+				default:
+					value = 'unsupported metric type';
+					break;
+				}
+			}
+
+			psargs.ps_print(psargs, {
+			    'when': when,
+			    'target': result.target,
+			    'metricName': metname,
+			    'value': value
+			});
+		});
+	});
+}
+
+function promstatReportTable(psargs, datapoint)
+{
+	var timestr, row;
+
+	timestr = datapoint.when.toISOString();
+	timestr = timestr.substr('2017-09-25T'.length, '15:40:22'.length);
+	row = {
+	    'TIME': timestr,
+	    'TARGET': datapoint.target.t_label
+	};
+	row[datapoint.metricName] = datapoint.value;
+	psargs.ps_table.writeRow(row);
+}
+
+function promstatReportFull(psargs, datapoint)
+{
+	/* XXX */
+	throw new Error('multiple metrics not yet implemented');
+}
+
+function promstatReportJson(psargs, datapoint)
+{
+	console.log(JSON.stringify(datapoint));
 }
 
 main();
