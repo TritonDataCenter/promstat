@@ -20,7 +20,7 @@ var psRunning = false;
 function main()
 {
 	var parser, option, args, p, t;
-	var promstatArgs;
+	var promstatCmd;
 
 	mod_cmdutil.configure({
 	    'usageMessage': 'poll and report Prometheus agent stats',
@@ -30,20 +30,49 @@ function main()
 	    ]
 	});
 
-	promstatArgs = {
+	/*
+	 * promstatCmd holds the state of this program.  This is mostly the
+	 * (immutable) arguments to the program, plus some state associated with
+	 * the pretty-printers.
+	 *
+	 * If the user requested JSON output with -j/--json, we'll switch this
+	 * to promstatReportJson.  Otherwise, if there's only one metric, we'll
+	 * use promstatReportTable to emit a compact tabular form.  Otherwise,
+	 * we'll use promstatReportFull.
+	 */
+	promstatCmd = {
+	    /* list of metric names requested by the user */
 	    'ps_metrics': [],
+	    /* list of targets requested by the user */
 	    'ps_targets': [],
-	    'ps_interval': 1000,
+	    /* interval (in milliseconds) to collect datapoints */
+	    'ps_intervalms': 1000,
+	    /* number of datapoints to collect before exiting */
 	    'ps_ndatapoints': null,
-	    'ps_print': promstatReportFull,
+	    /* number of datapoints emitted */
+	    'ps_nemitted': 0,
+	    /* handle to promstat library object */
+	    'ps_promstat': null,
+	    /* interval timer handle */
+	    'ps_interval': null,
+
+	    /* output function */
+	    'ps_print': null,
+	    /* timestamp of last data point emitted */
+	    'ps_last_time': null,
+	    /* node-tab table (only for tabular output) */
 	    'ps_table': null
 	};
+
+	/*
+	 * Parse named command-line arguments.
+	 */
 	parser = new mod_getopt.BasicParser('j(json)m:(metric)t:(target)',
 	    process.argv);
 	while ((option = parser.getopt()) !== undefined) {
 		switch (option.option) {
 		case 'j':
-			promstatArgs.ps_print = promstatReportJson;
+			promstatCmd.ps_print = promstatReportJson;
 			break;
 
 		case 'm':
@@ -53,7 +82,7 @@ function main()
 				mod_cmdutil.usage('unsupported argument ' +
 				    'for -m/--metric: "%s"', p);
 			}
-			promstatArgs.ps_metrics.push(p);
+			promstatCmd.ps_metrics.push(p);
 			break;
 
 		case 't':
@@ -63,7 +92,7 @@ function main()
 				    'unsupported argument for -t/--target: ' +
 				    '"%s"', option.optarg));
 			}
-			promstatArgs.ps_targets.push(t);
+			promstatCmd.ps_targets.push(t);
 			break;
 
 		default:
@@ -72,6 +101,9 @@ function main()
 		}
 	}
 
+	/*
+	 * Parse optional command-line arguments.
+	 */
 	args = process.argv.slice(parser.optind());
 	if (args.length > 0) {
 		p = mod_jsprim.parseInteger(args[0], {
@@ -88,7 +120,7 @@ function main()
 			    p, 'unsupported interval: "%s"', args[0]));
 		}
 
-		promstatArgs.ps_interval = p * 1000;
+		promstatCmd.ps_intervalms = p * 1000;
 
 		if (args.length > 1) {
 			p = mod_jsprim.parseInteger(args[1], {
@@ -105,34 +137,38 @@ function main()
 				    p, 'unsupported count: "%s"', args[1]));
 			}
 
-			promstatArgs.ps_ndatapoints = p;
+			promstatCmd.ps_ndatapoints = p;
 		}
 	}
 
-	if (promstatArgs.ps_metrics.length === 0) {
+	if (promstatCmd.ps_metrics.length === 0) {
 		mod_cmdutil.usage('must specify at least one metric');
 	}
 
-	if (promstatArgs.ps_targets.length === 0) {
+	if (promstatCmd.ps_targets.length === 0) {
 		mod_cmdutil.usage('must specify at least one target');
 	}
 
-	if (promstatArgs.ps_metrics.length == 1) {
-		promstatArgs.ps_print = promstatReportTable;
-		promstatArgs.ps_table = new mod_tab.TableOutputStream({
-		    'columns': [ {
-		        'label': 'TIME',
-			'width': 8
-		    }, {
-			'label': 'TARGET',
-			'width': 35
-		    }, {
-			'label': promstatArgs.ps_metrics[0]
-		    } ]
-		});
+	if (promstatCmd.ps_print === null) {
+		if (promstatCmd.ps_metrics.length == 1) {
+			promstatCmd.ps_print = promstatReportTable;
+			promstatCmd.ps_table = new mod_tab.TableOutputStream({
+			    'columns': [ {
+			        'label': 'TIME',
+				'width': 8
+			    }, {
+				'label': 'TARGET',
+				'width': 35
+			    }, {
+				'label': promstatCmd.ps_metrics[0]
+			    } ]
+			});
+		} else {
+			promstatCmd.ps_print = promstatReportFull;
+		}
 	}
 
-	promstatGo(promstatArgs);
+	promstatGo(promstatCmd);
 }
 
 function validateTarget(target)
@@ -192,11 +228,11 @@ function promstatGo(args)
 	mod_assertplus.object(args, 'args');
 	mod_assertplus.arrayOfObject(args.ps_targets, 'args.ps_targets');
 	mod_assertplus.arrayOfString(args.ps_metrics, 'args.ps_metrics');
-	mod_assertplus.number(args.ps_interval, 'args.ps_interval');
+	mod_assertplus.number(args.ps_intervalms, 'args.ps_intervalms');
 	mod_assertplus.optionalNumber(args.ps_ndatapoints,
 	    'args.ps_ndatapoints');
 
-	promstat = new lib_promstat.Promstat();
+	args.ps_promstat = promstat = new lib_promstat.Promstat();
 	args.ps_targets.forEach(function (t) {
 		promstat.addTarget(t);
 	});
@@ -204,7 +240,8 @@ function promstatGo(args)
 		promstat.addMetric(m);
 	});
 
-	setIntervalPrecise(promstatTick, args.ps_interval, args, promstat);
+	args.ps_interval = setIntervalPrecise(
+	    promstatTick, args.ps_intervalms, args, promstat);
 }
 
 function setIntervalPrecise(func, intervalms)
@@ -218,19 +255,29 @@ function setIntervalPrecise(func, intervalms)
 	interval = {
 	    'i_func': func,
 	    'i_interval': intervalms,
-	    'i_args': Array.prototype.slice.call(arguments, 2)
+	    'i_args': Array.prototype.slice.call(arguments, 2),
+	    'i_id': null
 	};
 
-	setTimeout(siFireTimeout, interval.i_interval, interval);
+	interval.i_id = setTimeout(
+	    siFireTimeout, interval.i_interval, interval);
+	return (interval);
 }
 
 function siFireTimeout(interval)
 {
-	setTimeout(siFireTimeout, interval.i_interval, interval);
+	interval.i_id = setTimeout(
+	    siFireTimeout, interval.i_interval, interval);
 	interval.i_func.apply(null, interval.i_args);
 }
 
-function promstatTick(psargs, promstat)
+function clearIntervalPrecise(interval)
+{
+	clearTimeout(interval.i_id);
+	interval.i_id = null;
+}
+
+function promstatTick(promstatCmd)
 {
 	var when;
 
@@ -239,8 +286,14 @@ function promstatTick(psargs, promstat)
 		return;
 	}
 
+	++promstatCmd.ps_nemitted;
+	if (promstatCmd.ps_ndatapoints !== null &&
+	    promstatCmd.ps_nemitted == promstatCmd.ps_ndatapoints) {
+		clearIntervalPrecise(promstatCmd.ps_interval);
+	}
+
 	when = new Date();
-	promstat.consume(function onConsume(merr, results) {
+	promstatCmd.ps_promstat.consume(function onConsume(merr, results) {
 		psRunning = false;
 
 		if (merr) {
@@ -249,17 +302,17 @@ function promstatTick(psargs, promstat)
 			});
 		}
 
-		promstatReport(when, psargs, promstat, results);
+		promstatReport(when, promstatCmd, results);
 	});
 }
 
-function promstatReport(when, psargs, promstat, results)
+function promstatReport(when, promstatCmd, results)
 {
 	mod_jsprim.forEachKey(results, function (_, result) {
 		mod_assertplus.object(result.target, 'result.target');
 		mod_assertplus.object(result.metrics, 'result.metrics');
 
-		psargs.ps_metrics.forEach(function (metname) {
+		promstatCmd.ps_metrics.forEach(function (metname) {
 			var met, value;
 
 			met = result.metrics[metname];
@@ -282,17 +335,19 @@ function promstatReport(when, psargs, promstat, results)
 				}
 			}
 
-			psargs.ps_print(psargs, {
+			promstatCmd.ps_print(promstatCmd, {
 			    'when': when,
 			    'target': result.target,
 			    'metricName': metname,
 			    'value': value
 			});
+
+			promstatCmd.ps_last_time = when.getTime();
 		});
 	});
 }
 
-function promstatReportTable(psargs, datapoint)
+function promstatReportTable(promstatCmd, datapoint)
 {
 	var timestr, row;
 
@@ -303,16 +358,20 @@ function promstatReportTable(psargs, datapoint)
 	    'TARGET': datapoint.target.t_label
 	};
 	row[datapoint.metricName] = datapoint.value;
-	psargs.ps_table.writeRow(row);
+	promstatCmd.ps_table.writeRow(row);
 }
 
-function promstatReportFull(psargs, datapoint)
+function promstatReportFull(promstatCmd, datapoint)
 {
-	/* XXX */
-	throw new Error('multiple metrics not yet implemented');
+	if (promstatCmd.ps_last_time != datapoint.when.getTime()) {
+		console.log('\n' + datapoint.when.toISOString());
+	}
+
+	console.log(datapoint.target.t_label);
+	console.log('%s %s', datapoint.metricName, datapoint.value);
 }
 
-function promstatReportJson(psargs, datapoint)
+function promstatReportJson(promstatCmd, datapoint)
 {
 	console.log(JSON.stringify(datapoint));
 }
