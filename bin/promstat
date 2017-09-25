@@ -5,9 +5,149 @@
  * promstat: command-line Prometheus poller
  */
 
+var mod_assertplus = require('assert-plus');
+var mod_cmdutil = require('cmdutil');
+var mod_getopt = require('posix-getopt');
+var mod_jsprim = require('jsprim');
+var mod_url = require('url');
+var VError = require('verror');
+
 function main()
 {
+	var parser, option, args, p, t;
+	var promstatArgs;
 
+	mod_cmdutil.configure({
+	    'usageMessage': 'poll and report Prometheus agent stats',
+	    'synopses': [
+		'-t/--target URL ... -m/--metric METRIC_NAME ... ' +
+		    '[INTERVAL [COUNT]]'
+	    ]
+	});
+
+	promstatArgs = {
+	    'ps_metrics': [],
+	    'ps_targets': [],
+	    'ps_interval': 1000,
+	    'ps_ndatapoints': null
+	};
+	parser = new mod_getopt.BasicParser('m:(metric)t:(target)',
+	    process.argv);
+	while ((option = parser.getopt()) !== undefined) {
+		switch (option.option) {
+		case 'm':
+			p = option.optarg;
+			/* TODO check this regexp against Prom docs */
+			if (!/^[a-zA-Z_0-9]+$/.test(p)) {
+				mod_cmdutil.usage('unsupported argument ' +
+				    'for -m/--metric: "%s"', p);
+			}
+			promstatArgs.ps_metrics.push(p);
+			break;
+
+		case 't':
+			t = validateTarget(option.optarg);
+			if (t instanceof Error) {
+				mod_cmdutil.usage(new VError(t,
+				    'unsupported argument for -t/--target: ' +
+				    '"%s"', option.optarg));
+			}
+			promstatArgs.ps_targets.push(t);
+			break;
+
+		default:
+			mod_cmdutil.usage();
+			break;
+		}
+	}
+
+	args = process.argv.slice(parser.optind());
+	if (args.length > 0) {
+		p = mod_jsprim.parseInteger(args[0], {
+		    'allowSign': false,
+		    'trimWhitespace': true
+		});
+
+		if (!(p instanceof Error) && p === 0) {
+			p = new VError('must be positive');
+		}
+
+		if (p instanceof Error) {
+			mod_cmdutil.usage(new VError(
+			    p, 'unsupported interval: "%s"', args[0]));
+		}
+
+		promstatArgs.ps_interval = p * 1000;
+
+		if (args.length > 1) {
+			p = mod_jsprim.parseInteger(args[1], {
+			    'allowSign': false,
+			    'trimWhitespace': true
+			});
+
+			if (!(p instanceof Error) && p === 0) {
+				p = new VError('must be positive');
+			}
+
+			if (p instanceof Error) {
+				mod_cmdutil.usage(new VError(
+				    p, 'unsupported count: "%s"', args[1]));
+			}
+
+			promstatArgs.ps_ndatapoints = p;
+		}
+	}
+
+	console.log(promstatArgs);
+}
+
+function validateTarget(target)
+{
+	var u, p;
+
+	mod_assertplus.string(target, 'target');
+	u = mod_url.parse(target);
+	if (u.protocol != 'http:') {
+		return (new VError('must be "http"'));
+	}
+
+	if (!u.slashes) {
+		return (new VError('bad URL format'));
+	}
+
+	if (u.auth !== null) {
+		return (new VError('auth not supported'));
+	}
+
+	if (u.hash !== null) {
+		return (new VError('hash not supported'));
+	}
+
+	if (u.search !== null) {
+		return (new VError('query string not supported'));
+	}
+
+	if (u.port !== null) {
+		p = mod_jsprim.parseInteger(u.port, {
+		    'allowSign': false
+		});
+		if (!(p instanceof Error)) {
+			if (p <= 0 || p >= 65536) {
+				p = new VError('port number out of range');
+			}
+		}
+		if (p instanceof Error) {
+			return (new VError(p, 'bad TCP port'));
+		}
+	} else {
+		p = 80;
+	}
+
+	return ({
+	    't_hostname': u.host,
+	    't_port': p,
+	    't_pathname': u.pathname
+	});
 }
 
 main();
