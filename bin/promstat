@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+/* vim: set ft=javascript: */
+
+/*
+ * promstat: command-line Prometheus poller
+ */
+
+function main()
+{
+
+}
+
+main();
