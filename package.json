@@ -18,5 +18,8 @@
 		"verror": "^1.10.0",
 		"vstream": "^0.1.0"
 	},
+	"devDependencies": {
+		"artedi": "^1.0.0"
+	},
 	"license": "MIT"
 }

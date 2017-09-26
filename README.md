@@ -7,6 +7,7 @@ format](https://prometheus.io/docs/instrumenting/exposition_formats/).
 ## TODO
 
 - add "-l" mode that just lists the metrics
+- when asking for unknown metrics, print "no data" instead of nothing
 - lib/promstat.js could use a lot of cleanup
 - initial data point should probably show time "-" or "all time" or something
 - figure out if counters should be normalized to the sample interval or not
