@@ -26,11 +26,14 @@
 
 var mod_assertplus = require('assert-plus');
 var mod_cmdutil = require('cmdutil');
+var mod_extsprintf = require('extsprintf');
 var mod_getopt = require('posix-getopt');
 var mod_jsprim = require('jsprim');
 var mod_tab = require('tab');
 var mod_url = require('url');
 var VError = require('verror');
+
+var printf = mod_extsprintf.printf;
 
 var lib_promstat = require('../lib/promstat');
 var lib_si = require('../lib/setinterval');
@@ -43,6 +46,7 @@ function main()
 	mod_cmdutil.configure({
 	    'usageMessage': 'poll and report Prometheus agent stats',
 	    'synopses': [
+		'-l/--list [-v/--verbose] -t/--target URL',
 		'[-j/--json] -t/--target URL ... -m/--metric METRIC_NAME ... ' +
 		    '[INTERVAL [COUNT]]'
 	    ]
@@ -82,21 +86,43 @@ function main()
 	    /* timestamp of last data point emitted */
 	    'ps_last_time': null,
 	    /* node-tab table (only for tabular output) */
-	    'ps_table': null
+	    'ps_table': null,
+
+	    /* just list the metrics */
+	    'ps_listonly': false,
+	    /* verbose listing */
+	    'ps_verbose': false
 	};
 
 	/*
 	 * Parse named command-line arguments.
 	 */
-	parser = new mod_getopt.BasicParser('j(json)m:(metric)t:(target)',
-	    process.argv);
+	parser = new mod_getopt.BasicParser('l(list)j(json)m:(metric)' +
+	    't:(target)v(verbose)', process.argv);
 	while ((option = parser.getopt()) !== undefined) {
 		switch (option.option) {
 		case 'j':
+			if (promstatCmd.ps_listonly) {
+				mod_cmdutil.usage('cannot use -j/--json with ' +
+				    '-l/--list');
+			}
 			promstatCmd.ps_print = promstatReportJson;
 			break;
 
+		case 'l':
+			if (promstatCmd.ps_print !== null ||
+			    promstatCmd.ps_metrics.length > 0) {
+				mod_cmdutil.usage('cannot use -l/--list with ' +
+				    '-j/--json or -m/--metric');
+			}
+			promstatCmd.ps_listonly = true;
+			break;
+
 		case 'm':
+			if (promstatCmd.ps_listonly) {
+				mod_cmdutil.usage('cannot use -m/--metric ' +
+				    'with -l/--list');
+			}
 			p = option.optarg;
 			/* TODO check this regexp against Prom docs */
 			if (!/^[a-zA-Z_0-9]+$/.test(p)) {
@@ -116,6 +142,10 @@ function main()
 			promstatCmd.ps_targets.push(t);
 			break;
 
+		case 'v':
+			promstatCmd.ps_verbose = true;
+			break;
+
 		default:
 			mod_cmdutil.usage();
 			break;
@@ -127,6 +157,10 @@ function main()
 	 */
 	args = process.argv.slice(parser.optind());
 	if (args.length > 0) {
+		if (promstatCmd.ps_listonly) {
+			mod_cmdutil.usage('unexpected arguments');
+		}
+
 		p = mod_jsprim.parseInteger(args[0], {
 		    'allowSign': false,
 		    'trimWhitespace': true
@@ -162,15 +196,21 @@ function main()
 		}
 	}
 
-	if (promstatCmd.ps_metrics.length === 0) {
-		mod_cmdutil.usage('must specify at least one metric');
+	if (!promstatCmd.ps_listonly) {
+		if (promstatCmd.ps_verbose) {
+			mod_cmdutil.usage('unexpected argument: -v/--verbose');
+		}
+
+		if (promstatCmd.ps_metrics.length === 0) {
+			mod_cmdutil.usage('must specify at least one metric');
+		}
 	}
 
 	if (promstatCmd.ps_targets.length === 0) {
 		mod_cmdutil.usage('must specify at least one target');
 	}
 
-	if (promstatCmd.ps_print === null) {
+	if (!promstatCmd.ps_listonly && promstatCmd.ps_print === null) {
 		if (promstatCmd.ps_metrics.length == 1) {
 			promstatCmd.ps_print = promstatReportTable;
 			promstatCmd.ps_table = new mod_tab.TableOutputStream({
@@ -271,8 +311,12 @@ function promstatGo(args)
 		promstat.addMetric(m);
 	});
 
-	args.ps_interval = lib_si.setIntervalPrecise(
-	    promstatTick, args.ps_intervalms, args, promstat);
+	if (!args.ps_listonly) {
+		args.ps_interval = lib_si.setIntervalPrecise(
+		    promstatTick, args.ps_intervalms, args);
+	}
+
+	setImmediate(promstatTick, args);
 }
 
 /*
@@ -309,8 +353,12 @@ function promstatTick(promstatCmd)
 			});
 		}
 
-		promstatReport(when, promstatCmd,
-		    promstatCmd.ps_promstat.allValues());
+		if (promstatCmd.ps_listonly) {
+			promstatReportMetrics(promstatCmd);
+		} else {
+			promstatReport(when, promstatCmd,
+			    promstatCmd.ps_promstat.allValues());
+		}
 	});
 }
 
@@ -320,6 +368,11 @@ function promstatTick(promstatCmd)
  */
 function promstatReport(when, promstatCmd, allvalues)
 {
+	if (promstatCmd.ps_last_time === null) {
+		promstatCmd.ps_last_time = when.getTime();
+		return;
+	}
+
 	mod_jsprim.forEachKey(allvalues, function (tid, result) {
 		mod_assertplus.object(result.target, 'result.target');
 		mod_assertplus.object(result.metrics, 'result.metrics');
@@ -380,6 +433,28 @@ function promstatReportFull(promstatCmd, datapoint)
 function promstatReportJson(promstatCmd, datapoint)
 {
 	console.log(JSON.stringify(datapoint));
+}
+
+/*
+ * Outputter that just lists the metrics.
+ */
+function promstatReportMetrics(promstatCmd)
+{
+	promstatCmd.ps_promstat.eachMetric(function iterMetric(metric) {
+		printf('%-10s %s\n', metric.m_type, metric.m_name);
+
+		if (metric.m_warning) {
+			mod_cmdutil.warn('targets reported different ' +
+			    'type or help message for metric "%s"',
+			    metric.m_name);
+		}
+
+		if (!promstatCmd.ps_verbose) {
+			return;
+		}
+
+		printf('    %s\n', metric.m_help);
+	});
 }
 
 main();
