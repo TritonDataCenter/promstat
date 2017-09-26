@@ -6,7 +6,13 @@ format](https://prometheus.io/docs/instrumenting/exposition_formats/).
 
 ## TODO
 
+- add "-l" mode that just lists the metrics
+- lib/promstat.js could use a lot of cleanup
+- initial data point should probably show time "-" or "all time" or something
+- figure out if counters should be normalized to the sample interval or not
+  (and implement that)
 - given a hostname target, expand to the list of all matching IPs
 - add ability to rename metrics in output (similar to ps(1))
-- add "-l" mode that just lists the metrics
 - add support for filter or breakdown by field using krill (+ skinner?)
+  In the limit, it would be nice if this looked like DTrace aggregation output,
+  and timestamp and target could just be two prepopulated fields.

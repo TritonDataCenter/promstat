@@ -3,6 +3,25 @@
 
 /*
  * promstat: command-line Prometheus poller
+ *
+ * There are a few levels of abstraction here:
+ *
+ * - promstat (this program): responsible for parsing command-line arguments,
+ *   managing a handle to the promstat library (in ./lib), and printing out
+ *   results.
+ *
+ * - lib/promstat.js (library): responsible for fetching metrics provided by
+ *   targets and tracking the values for the metrics requested by the user
+ *
+ * - lib/prometheus.js: responsible for fetching metrics provided by a target
+ *
+ * As an example, a user may request a metric like "http_requests_completed"
+ * from each of three targets.  promstat (the program) will instantiate a
+ * promstat library handle that requests that we track this metric from these
+ * three targets.  The promstat library handle will fetch _all_ metrics from
+ * each target (since that's the only operation that Prometheus provides), map
+ * those metrics onto whatever the user requested, and interpret the results
+ * accordingly (e.g., subtract values for counters, do nothing for gauges, etc).
  */
 
 var mod_assertplus = require('assert-plus');
@@ -281,7 +300,7 @@ function promstatTick(promstatCmd)
 
 	when = new Date();
 	promstatCmd.ps_running = true;
-	promstatCmd.ps_promstat.consume(function onConsume(merr, results) {
+	promstatCmd.ps_promstat.consume(function onConsume(merr) {
 		promstatCmd.ps_running = false;
 
 		if (merr) {
@@ -290,7 +309,8 @@ function promstatTick(promstatCmd)
 			});
 		}
 
-		promstatReport(when, promstatCmd, results);
+		promstatReport(when, promstatCmd,
+		    promstatCmd.ps_promstat.allValues());
 	});
 }
 
@@ -298,46 +318,25 @@ function promstatTick(promstatCmd)
  * Invoked after we've finished collecting data points from all targets to
  * process the output and print it out.
  */
-function promstatReport(when, promstatCmd, results)
+function promstatReport(when, promstatCmd, allvalues)
 {
-	mod_jsprim.forEachKey(results, function (_, result) {
+	mod_jsprim.forEachKey(allvalues, function (tid, result) {
 		mod_assertplus.object(result.target, 'result.target');
 		mod_assertplus.object(result.metrics, 'result.metrics');
 
-		promstatCmd.ps_metrics.forEach(function (metname) {
-			var met, value;
-
-			met = result.metrics[metname];
-			if (!met) {
-				value = 'no data';
-			} else {
-				switch (met.type) {
-				case 'counter':
-					value = 0;
-					mod_jsprim.forEachKey(
-					    met.valuesByFields,
-					    function (f, v) {
-						value += v;
-					    });
-					break;
-
-				default:
-					value = 'unsupported metric type';
-					break;
-				}
-			}
-
+		result.metrics.forEach(function (metric) {
 			promstatCmd.ps_print(promstatCmd, {
 			    'when': when,
 			    'target': result.target,
-			    'metricName': metname,
-			    'value': value
+			    'metricName': metric.m_name,
+			    'value': metric.m_value
 			});
 
 			promstatCmd.ps_last_time = when.getTime();
 		});
 	});
 }
+
 
 /*
  * Outputters
