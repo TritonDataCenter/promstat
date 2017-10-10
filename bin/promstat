@@ -38,6 +38,9 @@ var printf = mod_extsprintf.printf;
 var lib_promstat = require('../lib/promstat');
 var lib_si = require('../lib/setinterval');
 
+var PROMSTAT_CONCURRENCY = 10;
+var PROMSTAT_TIMEOUT = 5000;
+
 function main()
 {
 	var parser, option, args, p, t;
@@ -66,7 +69,8 @@ function main()
 	    /* list of metric names requested by the user */
 	    'ps_metrics': [],
 	    /* list of targets requested by the user */
-	    'ps_targets': [],
+	    'ps_targets': [], /* XXX remove this */
+	    'ps_consumer': new lib_promstat.PromConsumer(),
 	    /* interval (in milliseconds) to collect datapoints */
 	    'ps_intervalms': 1000,
 	    /* number of datapoints to collect before exiting */
@@ -140,6 +144,12 @@ function main()
 				    '"%s"', option.optarg));
 			}
 			promstatCmd.ps_targets.push(t);
+			promstatCmd.ps_consumer.addTarget({
+			    'label': t.t_label,
+			    'hostname': t.t_hostname,
+			    'port': t.t_port,
+			    'pathname': t.t_pathname
+			});
 			break;
 
 		case 'v':
@@ -208,6 +218,14 @@ function main()
 
 	if (promstatCmd.ps_targets.length === 0) {
 		mod_cmdutil.usage('must specify at least one target');
+	}
+
+	/*
+	 * XXX remove code for handling the list case elsewhere
+	 */
+	if (promstatCmd.ps_listonly) {
+		promstatListMetrics(promstatCmd);
+		return;
 	}
 
 	if (!promstatCmd.ps_listonly && promstatCmd.ps_print === null) {
@@ -290,6 +308,30 @@ function validateTarget(target)
 }
 
 /*
+ * Kick off the mode where we list metric metadata.
+ */
+function promstatListMetrics(args)
+{
+	lib_promstat.promListMetrics({
+	    'concurrency': PROMSTAT_CONCURRENCY,
+	    'requestTimeout': PROMSTAT_TIMEOUT,
+	    'consumer': args.ps_consumer
+	}, function (err, metadata) {
+		if (!metadata) {
+			mod_cmdutil.fail(err);
+		}
+
+		promstatReportMetrics(args, metadata);
+
+		if (err) {
+			VError.errorForEach(err, function iterError(e) {
+				mod_cmdutil.warn(e);
+			});
+		}
+	});
+}
+
+/*
  * Kick off the "promstat" program.
  */
 function promstatGo(args)
@@ -354,6 +396,7 @@ function promstatTick(promstatCmd)
 		}
 
 		if (promstatCmd.ps_listonly) {
+			/* XXX remove */
 			promstatReportMetrics(promstatCmd);
 		} else {
 			promstatReport(when, promstatCmd,
@@ -438,22 +481,17 @@ function promstatReportJson(promstatCmd, datapoint)
 /*
  * Outputter that just lists the metrics.
  */
-function promstatReportMetrics(promstatCmd)
+function promstatReportMetrics(promstatCmd, metadata)
 {
-	promstatCmd.ps_promstat.eachMetric(function iterMetric(metric) {
-		printf('%-10s %s\n', metric.m_type, metric.m_name);
+	printf('%-10s %-30s %s\n', 'TYPE', 'METRIC', 'NTARGS');
+	metadata.metrics.forEach(function (metric) {
+		printf('%-10s %-30s %6d\n', metric.pmm_type, metric.pmm_name,
+		    metric.pmm_ntargets);
 
-		if (metric.m_warning) {
-			mod_cmdutil.warn('targets reported different ' +
-			    'type or help message for metric "%s"',
-			    metric.m_name);
+		if (promstatCmd.ps_verbose) {
+			printf('    %s\n', metric.pmm_help);
 		}
 
-		if (!promstatCmd.ps_verbose) {
-			return;
-		}
-
-		printf('    %s\n', metric.m_help);
 	});
 }
 
