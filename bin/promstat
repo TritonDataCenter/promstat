@@ -38,92 +38,74 @@ var printf = mod_extsprintf.printf;
 var lib_promstat = require('../lib/promstat');
 var lib_si = require('../lib/setinterval');
 
-var PROMSTAT_CONCURRENCY = 10;
+var PROMSTAT_CONCURRENCY = 32;
 var PROMSTAT_TIMEOUT = 5000;
 
 function main()
 {
 	var parser, option, args, p, t;
-	var promstatCmd;
+	var ntargets, pscmd;
 
 	mod_cmdutil.configure({
 	    'usageMessage': 'poll and report Prometheus agent stats',
 	    'synopses': [
-		'-l/--list [-v/--verbose] -t/--target URL',
-		'[-j/--json] -t/--target URL ... -m/--metric METRIC_NAME ... ' +
+		'-t/--target URL ... -l/--list [-v/--verbose] ',
+		'-t/--target URL ... -m/--metric METRIC_NAME ... OPTIONS...' +
 		    '[INTERVAL [COUNT]]'
 	    ]
 	});
 
 	/*
-	 * promstatCmd holds the state of this program.  This is mostly the
+	 * pscmd holds the state of this program.  This is mostly the
 	 * (immutable) arguments to the program, plus some state associated with
 	 * the pretty-printers.
 	 *
-	 * If the user requested JSON output with -j/--json, we'll switch this
-	 * to promstatReportJson.  Otherwise, if there's only one metric, we'll
-	 * use promstatReportTable to emit a compact tabular form.  Otherwise,
-	 * we'll use promstatReportFull.
+	 * If there's only one metric, we'll use promstatReportTable to emit a
+	 * compact tabular form.  Otherwise, we'll use promstatReportFull.
 	 */
-	promstatCmd = {
+	pscmd = {
 	    /* list of metric names requested by the user */
-	    'ps_metrics': [],
+	    'pscmd_metrics': [],
 	    /* list of targets requested by the user */
-	    'ps_targets': [], /* XXX remove this */
-	    'ps_consumer': new lib_promstat.PromConsumer(),
+	    'pscmd_consumer': new lib_promstat.PromConsumer(),
 	    /* interval (in milliseconds) to collect datapoints */
-	    'ps_intervalms': 1000,
+	    'pscmd_intervalms': 1000,
 	    /* number of datapoints to collect before exiting */
-	    'ps_ndatapoints': null,
+	    'pscmd_ndatapoints': null,
 	    /* number of datapoints emitted */
-	    'ps_nemitted': 0,
+	    'pscmd_nemitted': 0,
 	    /* handle to promstat library object */
-	    'ps_promstat': null,
-	    /* interval timer handle */
-	    'ps_interval': null,
-
-	    /* consume() operation is currently running */
-	    'ps_running': false,
+	    'pscmd_promstat': null,
 
 	    /* output function */
-	    'ps_print': null,
-	    /* timestamp of last data point emitted */
-	    'ps_last_time': null,
+	    'pscmd_print': null,
 	    /* node-tab table (only for tabular output) */
-	    'ps_table': null,
+	    'pscmd_table': null,
 
 	    /* just list the metrics */
-	    'ps_listonly': false,
+	    'pscmd_listonly': false,
 	    /* verbose listing */
-	    'ps_verbose': false
+	    'pscmd_verbose': false
 	};
 
 	/*
 	 * Parse named command-line arguments.
 	 */
-	parser = new mod_getopt.BasicParser('l(list)j(json)m:(metric)' +
-	    't:(target)v(verbose)', process.argv);
+	parser = new mod_getopt.BasicParser('l(list)m:(metric)' +
+	    'o:(output)t:(target)v(verbose)', process.argv);
 	while ((option = parser.getopt()) !== undefined) {
 		switch (option.option) {
-		case 'j':
-			if (promstatCmd.ps_listonly) {
-				mod_cmdutil.usage('cannot use -j/--json with ' +
-				    '-l/--list');
-			}
-			promstatCmd.ps_print = promstatReportJson;
-			break;
-
 		case 'l':
-			if (promstatCmd.ps_print !== null ||
-			    promstatCmd.ps_metrics.length > 0) {
+			if (pscmd.pscmd_print !== null ||
+			    pscmd.pscmd_metrics.length > 0) {
 				mod_cmdutil.usage('cannot use -l/--list with ' +
-				    '-j/--json or -m/--metric');
+				    '-o/--output or -m/--metric');
 			}
-			promstatCmd.ps_listonly = true;
+			pscmd.pscmd_listonly = true;
 			break;
 
 		case 'm':
-			if (promstatCmd.ps_listonly) {
+			if (pscmd.pscmd_listonly) {
 				mod_cmdutil.usage('cannot use -m/--metric ' +
 				    'with -l/--list');
 			}
@@ -133,7 +115,25 @@ function main()
 				mod_cmdutil.usage('unsupported argument ' +
 				    'for -m/--metric: "%s"', p);
 			}
-			promstatCmd.ps_metrics.push(p);
+			pscmd.pscmd_metrics.push(p);
+			break;
+
+		case 'o':
+			switch (option.optarg) {
+			case 'compact':
+				pscmd.pscmd_print = promstatReportTable;
+				break;
+
+			case 'full':
+				pscmd.pscmd_print = promstatReportFull;
+				break;
+
+			default:
+				mod_cmdutil.usage('unsupported argument ' +
+				    'for -o/--output: "%s" (must be ' +
+				    '"compact" or "full"', option.optarg);
+				break;
+			}
 			break;
 
 		case 't':
@@ -143,8 +143,8 @@ function main()
 				    'unsupported argument for -t/--target: ' +
 				    '"%s"', option.optarg));
 			}
-			promstatCmd.ps_targets.push(t);
-			promstatCmd.ps_consumer.addTarget({
+			ntargets++;
+			pscmd.pscmd_consumer.addTarget({
 			    'label': t.t_label,
 			    'hostname': t.t_hostname,
 			    'port': t.t_port,
@@ -153,7 +153,7 @@ function main()
 			break;
 
 		case 'v':
-			promstatCmd.ps_verbose = true;
+			pscmd.pscmd_verbose = true;
 			break;
 
 		default:
@@ -167,7 +167,7 @@ function main()
 	 */
 	args = process.argv.slice(parser.optind());
 	if (args.length > 0) {
-		if (promstatCmd.ps_listonly) {
+		if (pscmd.pscmd_listonly) {
 			mod_cmdutil.usage('unexpected arguments');
 		}
 
@@ -185,7 +185,7 @@ function main()
 			    p, 'unsupported interval: "%s"', args[0]));
 		}
 
-		promstatCmd.ps_intervalms = p * 1000;
+		pscmd.pscmd_intervalms = p * 1000;
 
 		if (args.length > 1) {
 			p = mod_jsprim.parseInteger(args[1], {
@@ -202,54 +202,58 @@ function main()
 				    p, 'unsupported count: "%s"', args[1]));
 			}
 
-			promstatCmd.ps_ndatapoints = p;
+			pscmd.pscmd_ndatapoints = p;
 		}
 	}
 
-	if (!promstatCmd.ps_listonly) {
-		if (promstatCmd.ps_verbose) {
-			mod_cmdutil.usage('unexpected argument: -v/--verbose');
-		}
-
-		if (promstatCmd.ps_metrics.length === 0) {
-			mod_cmdutil.usage('must specify at least one metric');
-		}
-	}
-
-	if (promstatCmd.ps_targets.length === 0) {
+	if (ntargets === 0) {
 		mod_cmdutil.usage('must specify at least one target');
 	}
 
-	/*
-	 * XXX remove code for handling the list case elsewhere
-	 */
-	if (promstatCmd.ps_listonly) {
-		promstatListMetrics(promstatCmd);
+	if (pscmd.pscmd_listonly) {
+		promstatListMetrics(pscmd);
 		return;
 	}
 
-	if (!promstatCmd.ps_listonly && promstatCmd.ps_print === null) {
-		if (promstatCmd.ps_metrics.length == 1) {
-			promstatCmd.ps_print = promstatReportTable;
-			promstatCmd.ps_table = new mod_tab.TableOutputStream({
-			    'columns': [ {
-			        'label': 'TIME',
-				'width': 8
-			    }, {
-				'label': 'TARGET',
-				'width': 35
-			    }, {
-				'label': promstatCmd.ps_metrics[0],
-				'align': 'right',
-				'width': promstatCmd.ps_metrics[0].length
-			    } ]
-			});
-		} else {
-			promstatCmd.ps_print = promstatReportFull;
-		}
+	if (pscmd.pscmd_verbose) {
+		mod_cmdutil.usage('unexpected argument: -v/--verbose');
 	}
 
-	promstatGo(promstatCmd);
+	if (pscmd.pscmd_metrics.length === 0) {
+		mod_cmdutil.usage('must specify at least one metric');
+	}
+
+	/*
+	 * It's potentially very bad to use unbounded concurrency, but it might
+	 * also be confusing if we don't, since the timing of datapoints from
+	 * targets later in the list will be greatly affected by the response
+	 * time of previous targets.  Warn the user in such cases.  If this
+	 * becomes a problem, we probably want to bump the default concurrency
+	 * and add a flag for changing it.  But this tool is really only
+	 * intended to watch a handful of targets anyway.
+	 */
+	if (ntargets > PROMSTAT_CONCURRENCY) {
+		mod_cmdutil.warn('number of targets (%d) exceeds ' +
+		    'concurrency (%s).  Timing of data points may be ' +
+		    'misleading.', ntargets, PROMSTAT_CONCURRENCY);
+	}
+
+	pscmd.pscmd_promstat = new lib_promstat.Promstat({
+	    'consumer': pscmd.pscmd_consumer,
+	    'concurrency': PROMSTAT_CONCURRENCY,
+	    'requestTimeout': PROMSTAT_TIMEOUT,
+	    'interval': pscmd.pscmd_intervalms,
+	    'niterations': pscmd.pscmd_ndatapoints
+	});
+
+	pscmd.pscmd_metrics.forEach(function (m) {
+		pscmd.pscmd_promstat.addMetric({ 'name': m });
+	});
+
+	pscmd.pscmd_promstat.start();
+	pscmd.pscmd_promstat.on('tick', function onTick(datapoint) {
+		promstatTick(pscmd, datapoint);
+	});
 }
 
 /*
@@ -315,7 +319,7 @@ function promstatListMetrics(args)
 	lib_promstat.promListMetrics({
 	    'concurrency': PROMSTAT_CONCURRENCY,
 	    'requestTimeout': PROMSTAT_TIMEOUT,
-	    'consumer': args.ps_consumer
+	    'consumer': args.pscmd_consumer
 	}, function (err, metadata) {
 		if (!metadata) {
 			mod_cmdutil.fail(err);
@@ -331,164 +335,154 @@ function promstatListMetrics(args)
 	});
 }
 
-/*
- * Kick off the "promstat" program.
- */
-function promstatGo(args)
+function promstatTick(pscmd, datapoint)
 {
-	var promstat;
-
-	mod_assertplus.object(args, 'args');
-	mod_assertplus.arrayOfObject(args.ps_targets, 'args.ps_targets');
-	mod_assertplus.arrayOfString(args.ps_metrics, 'args.ps_metrics');
-	mod_assertplus.number(args.ps_intervalms, 'args.ps_intervalms');
-	mod_assertplus.optionalNumber(args.ps_ndatapoints,
-	    'args.ps_ndatapoints');
-
-	args.ps_promstat = promstat = new lib_promstat.Promstat();
-	args.ps_targets.forEach(function (t) {
-		promstat.addTarget(t);
-	});
-	args.ps_metrics.forEach(function (m) {
-		promstat.addMetric(m);
-	});
-
-	if (!args.ps_listonly) {
-		args.ps_interval = lib_si.setIntervalPrecise(
-		    promstatTick, args.ps_intervalms, args);
-	}
-
-	setImmediate(promstatTick, args);
-}
-
-/*
- * Invoked once per interval to fetch stats and print them out.  This currently
- * skips an iteration if any call is outstanding.
- */
-function promstatTick(promstatCmd)
-{
-	var when;
-
-	if (promstatCmd.ps_running) {
-		/* TODO what do we really want to do in this case? */
-		return;
-	}
-
 	/*
-	 * If this is the last data point, all we have to do to stop the program
-	 * is to clear the interval timer.
+	 * If this is the first time through, and the user did not specifically
+	 * specify which output format to use, then we'll select the format now
+	 * based on the types of the metrics that we found.
 	 */
-	++promstatCmd.ps_nemitted;
-	if (promstatCmd.ps_ndatapoints !== null &&
-	    promstatCmd.ps_nemitted == promstatCmd.ps_ndatapoints) {
-		lib_si.clearIntervalPrecise(promstatCmd.ps_interval);
-	}
+	var canusetbl, tgtkey, tblcols;
 
-	when = new Date();
-	promstatCmd.ps_running = true;
-	promstatCmd.ps_promstat.consume(function onConsume(merr) {
-		promstatCmd.ps_running = false;
+	if (pscmd.pscmd_print === null) {
+		canusetbl = true;
+		tgtkey = Object.keys(datapoint.psd_tgtvalues)[0];
+		mod_assertplus.string(tgtkey,
+		    'there must always be at least one target');
+		datapoint.psd_tgtvalues[tgtkey].values.forEach(
+		    function (metricValue) {
+			canusetbl = canusetbl &&
+			    metricValue.metadata !== null &&
+			    (metricValue.metadata.pmm_type == 'counter' ||
+			    metricValue.metadata.pmm_type == 'gauge');
+		    });
 
-		if (merr) {
-			VError.errorForEach(merr, function (err) {
-				mod_cmdutil.warn(err);
-			});
-		}
-
-		if (promstatCmd.ps_listonly) {
-			/* XXX remove */
-			promstatReportMetrics(promstatCmd);
+		if (canusetbl) {
+			pscmd.pscmd_print = promstatReportTable;
 		} else {
-			promstatReport(when, promstatCmd,
-			    promstatCmd.ps_promstat.allValues());
+			pscmd.pscmd_print = promstatReportFull;
 		}
-	});
-}
-
-/*
- * Invoked after we've finished collecting data points from all targets to
- * process the output and print it out.
- */
-function promstatReport(when, promstatCmd, allvalues)
-{
-	if (promstatCmd.ps_last_time === null) {
-		promstatCmd.ps_last_time = when.getTime();
-		return;
 	}
 
-	mod_jsprim.forEachKey(allvalues, function (tid, result) {
-		mod_assertplus.object(result.target, 'result.target');
-		mod_assertplus.object(result.metrics, 'result.metrics');
-
-		result.metrics.forEach(function (metric) {
-			promstatCmd.ps_print(promstatCmd, {
-			    'when': when,
-			    'target': result.target,
-			    'metricName': metric.m_name,
-			    'value': metric.m_value
+	if (pscmd.pscmd_print == promstatReportTable &&
+	    pscmd.pscmd_table === null) {
+		tgtkey = Object.keys(datapoint.psd_tgtvalues)[0];
+		mod_assertplus.string(tgtkey,
+		    'there must always be at least one target');
+		tblcols = [];
+		datapoint.psd_tgtvalues[tgtkey].values.forEach(
+		    function (metricValue, i) {
+			var name = pscmd.pscmd_metrics[i];
+			tblcols.push({
+			    'label': name,
+			    'align': 'right',
+			    'width': Math.max(6, name.length)
 			});
-
-			promstatCmd.ps_last_time = when.getTime();
+		    });
+		pscmd.pscmd_table = new mod_tab.TableOutputStream({
+		    'columns': [ {
+		        'label': 'TIME',
+			'width': 8
+		    }, {
+			'label': 'TARGET',
+			'width': 35
+		    } ].concat(tblcols)
 		});
+	}
+
+	datapoint.psd_warnings.forEach(function (w) {
+		mod_cmdutil.warn(w);
 	});
+
+	pscmd.pscmd_print(pscmd, datapoint);
 }
 
 
 /*
  * Outputters
+ * XXX these all need to be revisited
  */
+
+function promstatValue(metricValue)
+{
+	if (metricValue['latestRaw'] === null) {
+		return ('no data');
+	}
+
+	if (metricValue['latestRaw'] instanceof Error) {
+		return (metricValue['latestRaw'].message);
+	}
+
+	if (metricValue.metadata.pmm_type == 'counter') {
+		return (mod_jsprim.hasKey(
+		    metricValue, 'latestDelta') ?
+		    metricValue['latestDelta'] :
+		    metricValue['latestRaw'] + '*');
+	}
+
+	if (metricValue.metadata.pmm_type == 'gauge') {
+		return (metricValue['latestRaw']);
+	}
+
+	return ('unsupported type');
+}
 
 /*
  * Compact, tabular output is used when there's exactly one metric.
  */
-function promstatReportTable(promstatCmd, datapoint)
+function promstatReportTable(pscmd, datapoint)
 {
-	var timestr, row;
+	var timestr;
 
-	timestr = datapoint.when.toISOString();
+	timestr = datapoint.psd_start.toISOString();
 	timestr = timestr.substr('2017-09-25T'.length, '15:40:22'.length);
-	row = {
-	    'TIME': timestr,
-	    'TARGET': datapoint.target.t_label
-	};
-	row[datapoint.metricName] = datapoint.value;
-	promstatCmd.ps_table.writeRow(row);
+	mod_jsprim.forEachKey(datapoint.psd_tgtvalues,
+	    function (tgtid, tgtinfo) {
+		var row;
+		row = {
+		    'TIME': timestr,
+		    'TARGET': tgtinfo.target.pt_label
+		};
+		tgtinfo.values.forEach(function (metricValue, i) {
+			row[pscmd.pscmd_metrics[i]] = promstatValue(
+			    metricValue);
+		});
+		pscmd.pscmd_table.writeRow(row);
+	    });
 }
 
 /*
  * Full output is used by default.  It's not especially convenient to read, but
  * it includes all of the data.
  */
-function promstatReportFull(promstatCmd, datapoint)
+function promstatReportFull(pscmd, datapoint)
 {
-	if (promstatCmd.ps_last_time != datapoint.when.getTime()) {
-		console.log('\n' + datapoint.when.toISOString());
-	}
+	console.log(datapoint.psd_start.toISOString());
 
-	console.log(datapoint.target.t_label);
-	console.log('%s %s', datapoint.metricName, datapoint.value);
-}
+	mod_jsprim.forEachKey(datapoint.psd_tgtvalues,
+	    function (tgtid, tgtinfo) {
+		printf('    %s\n', tgtinfo.target.pt_label);
+		tgtinfo.values.forEach(function (metricValue, i) {
+			printf('        %-40s %s\n',
+			    pscmd.pscmd_metrics[i],
+			    promstatValue(metricValue));
+		});
+	    });
 
-/*
- * If the consumer wants JSON output, they may as well use the HTTP API that
- * we're querying directly, but we have it here because it's easy to do.
- */
-function promstatReportJson(promstatCmd, datapoint)
-{
-	console.log(JSON.stringify(datapoint));
+	printf('\n');
 }
 
 /*
  * Outputter that just lists the metrics.
  */
-function promstatReportMetrics(promstatCmd, metadata)
+function promstatReportMetrics(pscmd, metadata)
 {
 	printf('%-10s %-30s %s\n', 'TYPE', 'METRIC', 'NTARGS');
 	metadata.metrics.forEach(function (metric) {
 		printf('%-10s %-30s %6d\n', metric.pmm_type, metric.pmm_name,
 		    metric.pmm_ntargets);
 
-		if (promstatCmd.ps_verbose) {
+		if (pscmd.pscmd_verbose) {
 			printf('    %s\n', metric.pmm_help);
 		}
 
