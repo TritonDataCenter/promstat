@@ -35,6 +35,7 @@ var VError = require('verror');
 
 var printf = mod_extsprintf.printf;
 
+var lib_prometheus = require('../lib/prometheus');
 var lib_promstat = require('../lib/promstat');
 var lib_si = require('../lib/setinterval');
 
@@ -110,8 +111,7 @@ function main()
 				    'with -l/--list');
 			}
 			p = option.optarg;
-			/* TODO check this regexp against Prom docs */
-			if (!/^[a-zA-Z_0-9]+$/.test(p)) {
+			if (!lib_prometheus.PROM_REGEXP_METRIC_NAME.test(p)) {
 				mod_cmdutil.usage('unsupported argument ' +
 				    'for -m/--metric: "%s"', p);
 			}
@@ -400,10 +400,9 @@ function promstatTick(pscmd, datapoint)
 
 /*
  * Outputters
- * XXX these all need to be revisited
  */
 
-function promstatValue(metricValue)
+function promstatValue(metricValue, compact)
 {
 	if (metricValue['latestRaw'] === null) {
 		return ('no data');
@@ -422,6 +421,28 @@ function promstatValue(metricValue)
 
 	if (metricValue.metadata.pmm_type == 'gauge') {
 		return (metricValue['latestRaw']);
+	}
+
+	if (metricValue.metadata.pmm_type == 'histogram') {
+		if (compact) {
+			/*
+			 * For now, indicate that we can't print a single-cell
+			 * representation of a histogram.  We could consider
+			 * trying to print an inline histogram the way DTrace
+			 * does with the "agghist" option.
+			 */
+			return ('(histogram)');
+		}
+
+		/*
+		 * This could be cleaner.
+		 */
+		return ('\n' + lib_promstat.promPrintDistribution({
+		    'distribution': mod_jsprim.hasKey(
+		        metricValue, 'latestDelta') ?
+			metricValue['latestDelta'] :
+			metricValue['latestRaw']
+		}));
 	}
 
 	return ('unsupported type');
@@ -444,8 +465,9 @@ function promstatReportTable(pscmd, datapoint)
 		    'TARGET': tgtinfo.target.pt_label
 		};
 		tgtinfo.values.forEach(function (metricValue, i) {
+			/* XXX */
 			row[pscmd.pscmd_metrics[i]] = promstatValue(
-			    metricValue);
+			    metricValue, true);
 		});
 		pscmd.pscmd_table.writeRow(row);
 	    });
@@ -463,6 +485,7 @@ function promstatReportFull(pscmd, datapoint)
 	    function (tgtid, tgtinfo) {
 		printf('    %s\n', tgtinfo.target.pt_label);
 		tgtinfo.values.forEach(function (metricValue, i) {
+			/* XXX needs to handle distributions better */
 			printf('        %-40s %s\n',
 			    pscmd.pscmd_metrics[i],
 			    promstatValue(metricValue));
